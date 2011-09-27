@@ -21,6 +21,8 @@
 #include "internal.h"
 #include "gc.h"
 #include "constant.h"
+#include "node.h"
+#include "regint.h"
 #include <stdio.h>
 #include <setjmp.h>
 #include <sys/types.h>
@@ -79,6 +81,13 @@ void *alloca ();
 #endif
 #define HEAP_MIN_SLOTS 10000
 #define FREE_MIN  4096
+
+static size_t memsize_of(VALUE);
+size_t rb_str_memsize(VALUE);
+size_t rb_ary_memsize(VALUE);
+size_t rb_io_memsize(const rb_io_t *);
+size_t rb_generic_ivar_memsize(VALUE);
+size_t rb_objspace_data_type_memsize(VALUE obj);
 
 static unsigned int initial_malloc_limit   = GC_MALLOC_LIMIT;
 #if defined(ENABLE_VM_OBJSPACE) && ENABLE_VM_OBJSPACE
@@ -284,7 +293,10 @@ typedef struct RVALUE {
     const char *file;
     int   line;
 #endif
+  uint64_t gc_obj_id;
 } RVALUE;
+
+static uint64_t last_gc_obj_id = 0;
 
 #if defined(_MSC_VER) || defined(__BORLANDC__) || defined(__CYGWIN__)
 #pragma pack(pop)
@@ -364,7 +376,7 @@ typedef struct rb_objspace {
 
 #if defined(ENABLE_VM_OBJSPACE) && ENABLE_VM_OBJSPACE
 #define rb_objspace (*GET_VM()->objspace)
-static int ruby_initial_gc_stress = 0;
+static int ruby_initial_gc_stress = 1;
 int *ruby_initial_gc_stress_ptr = &ruby_initial_gc_stress;
 #else
 static rb_objspace_t rb_objspace = {{GC_MALLOC_LIMIT}, {HEAP_MIN_SLOTS}};
@@ -1152,7 +1164,7 @@ VALUE
 rb_newobj(void)
 {
     rb_objspace_t *objspace = &rb_objspace;
-    VALUE obj;
+    RVALUE* obj;
 
     if (UNLIKELY(during_gc)) {
 	dont_gc = 1;
@@ -1174,17 +1186,18 @@ rb_newobj(void)
 	}
     }
 
-    obj = (VALUE)freelist;
+    obj = freelist;
     freelist = freelist->as.free.next;
 
-    MEMZERO((void*)obj, RVALUE, 1);
+    MEMZERO(obj, RVALUE, 1);
 #ifdef GC_DEBUG
     RANY(obj)->file = rb_sourcefile();
     RANY(obj)->line = rb_sourceline();
 #endif
     GC_PROF_INC_LIVE_NUM;
 
-    return obj;
+    obj->gc_obj_id = ++last_gc_obj_id;
+    return (VALUE)obj;
 }
 
 NODE*
@@ -2249,6 +2262,8 @@ make_io_deferred(RVALUE *p)
 static int
 obj_free(rb_objspace_t *objspace, VALUE obj)
 {
+  rb_gc_free_trace(obj);
+
     switch (BUILTIN_TYPE(obj)) {
       case T_NIL:
       case T_FIXNUM:
@@ -3637,4 +3652,201 @@ Init_GC(void)
     rb_define_singleton_method(rb_mGC, "malloc_allocated_size", gc_malloc_allocated_size, 0);
     rb_define_singleton_method(rb_mGC, "malloc_allocations", gc_malloc_allocations, 0);
 #endif
+}
+
+const char *
+rb_type_class_str(enum ruby_value_type type)
+{
+    switch (type) {
+      case T_NONE: return "none";
+      case T_OBJECT: return "Object";
+      case T_CLASS: return "Class";
+      case T_MODULE: return "Module";
+      case T_FLOAT: return "Float";
+      case T_STRING: return "String";
+      case T_REGEXP: return "Regexp";
+      case T_ARRAY: return "Array";
+      case T_HASH: return "Hash";
+      case T_STRUCT: return "Struct";
+      case T_BIGNUM: return "Bignum";
+      case T_FILE: return "File";
+      case T_DATA: return "Data";
+      case T_MATCH: return "Match";
+      case T_COMPLEX: return "Complex";
+      case T_RATIONAL: return "Rational";
+      case T_NIL: return "NilClass";
+      case T_TRUE: return "TrueClass";
+      case T_FALSE: return "FalseClass";
+      case T_SYMBOL: return "Symbol";
+      case T_FIXNUM: return "Fixnum";
+      case T_UNDEF: return "undefined";
+      case T_NODE: return "node";
+      case T_ICLASS: return "IClass";
+      default: return "zombie";
+    }
+}
+
+void
+rb_gc_alloc_trace(VALUE obj) {
+    struct timeval tim;
+    gettimeofday(&tim, NULL);
+    printf("%ds:%dus: rb_newobj(#%012llu, %s, %s)\n",
+      tim.tv_sec,
+      tim.tv_usec,
+      ((RVALUE*)obj)->gc_obj_id,
+      rb_type_str(BUILTIN_TYPE(obj)),
+      BUILTIN_TYPE(obj) == T_OBJECT ? rb_obj_classname(obj) : rb_type_class_str(BUILTIN_TYPE(obj)));
+    return;
+}
+
+void
+rb_gc_free_trace(VALUE obj) {
+    struct timeval tim;
+    gettimeofday(&tim, NULL);
+    printf("%ds:%dus: objfree(#%012llu, %s, %s, %zuB)\n",
+      tim.tv_sec,
+      tim.tv_usec,
+      ((RVALUE*)obj)->gc_obj_id,
+      rb_type_str(BUILTIN_TYPE(obj)),
+      BUILTIN_TYPE(obj) == T_OBJECT ? rb_obj_classname(obj) : rb_type_class_str(BUILTIN_TYPE(obj)),
+      sizeof(RVALUE) + memsize_of(obj));
+    return;
+}
+
+static size_t
+memsize_of(VALUE obj)
+{
+    size_t size = 0;
+
+    if (SPECIAL_CONST_P(obj)) {
+	return 0;
+    }
+
+    if (FL_TEST(obj, FL_EXIVAR)) {
+	size += rb_generic_ivar_memsize(obj);
+    }
+
+    switch (BUILTIN_TYPE(obj)) {
+      case T_OBJECT:
+	if (!(RBASIC(obj)->flags & ROBJECT_EMBED) &&
+	    ROBJECT(obj)->as.heap.ivptr) {
+	    size += ROBJECT(obj)->as.heap.numiv * sizeof(VALUE);
+	}
+	break;
+      case T_MODULE:
+      case T_CLASS:
+	size += st_memsize(RCLASS_M_TBL(obj));
+	if (RCLASS_IV_TBL(obj)) {
+	    size += st_memsize(RCLASS_IV_TBL(obj));
+	}
+	if (RCLASS_IV_INDEX_TBL(obj)) {
+	    size += st_memsize(RCLASS_IV_INDEX_TBL(obj));
+	}
+	if (RCLASS(obj)->ptr->iv_tbl) {
+	    size += st_memsize(RCLASS(obj)->ptr->iv_tbl);
+	}
+	if (RCLASS(obj)->ptr->const_tbl) {
+	    size += st_memsize(RCLASS(obj)->ptr->const_tbl);
+	}
+	size += sizeof(rb_classext_t);
+	break;
+      case T_STRING:
+	size += rb_str_memsize(obj);
+	break;
+      case T_ARRAY:
+	size += rb_ary_memsize(obj);
+	break;
+      case T_HASH:
+	if (RHASH(obj)->ntbl) {
+	    size += st_memsize(RHASH(obj)->ntbl);
+	}
+	break;
+      case T_REGEXP:
+	if (RREGEXP(obj)->ptr) {
+	    size += onig_memsize(RREGEXP(obj)->ptr);
+	}
+	break;
+      case T_DATA:
+	size += rb_objspace_data_type_memsize(obj);
+	break;
+      case T_MATCH:
+	if (RMATCH(obj)->rmatch) {
+            struct rmatch *rm = RMATCH(obj)->rmatch;
+	    size += sizeof(struct re_registers); /* TODO: onig_region_memsize(&rm->regs); */
+	    size += sizeof(struct rmatch_offset) * rm->char_offset_num_allocated;
+	    size += sizeof(struct rmatch);
+	}
+	break;
+      case T_FILE:
+	if (RFILE(obj)->fptr) {
+	    size += rb_io_memsize(RFILE(obj)->fptr);
+	}
+	break;
+      case T_RATIONAL:
+      case T_COMPLEX:
+	break;
+      case T_ICLASS:
+	/* iClass shares table with the module */
+	break;
+
+      case T_FLOAT:
+	break;
+
+      case T_BIGNUM:
+	if (!(RBASIC(obj)->flags & RBIGNUM_EMBED_FLAG) && RBIGNUM_DIGITS(obj)) {
+	    size += RBIGNUM_LEN(obj) * sizeof(BDIGIT);
+	}
+	break;
+      case T_NODE:
+	switch (nd_type(obj)) {
+	  case NODE_SCOPE:
+	    if (RNODE(obj)->u1.tbl) {
+		/* TODO: xfree(RANY(obj)->as.node.u1.tbl); */
+	    }
+	    break;
+	  case NODE_ALLOCA:
+	    /* TODO: xfree(RANY(obj)->as.node.u1.node); */
+	    ;
+	}
+	break;			/* no need to free iv_tbl */
+
+      case T_STRUCT:
+	if ((RBASIC(obj)->flags & RSTRUCT_EMBED_LEN_MASK) == 0 &&
+	    RSTRUCT(obj)->as.heap.ptr) {
+	    size += sizeof(VALUE) * RSTRUCT_LEN(obj);
+	}
+	break;
+
+      case T_ZOMBIE:
+	break;
+
+      default:
+	rb_bug("objspace/memsize_of(): unknown data type 0x%x(%p)",
+	       BUILTIN_TYPE(obj), (void*)obj);
+    }
+
+    return size;
+}
+
+static int
+set_zero_i(st_data_t key, st_data_t val, st_data_t arg)
+{
+    VALUE k = (VALUE)key;
+    VALUE hash = (VALUE)arg;
+    rb_hash_aset(hash, k, INT2FIX(0));
+    return ST_CONTINUE;
+}
+
+static int
+cos_i(void *vstart, void *vend, size_t stride, void *data)
+{
+    size_t *counts = (size_t *)data;
+    VALUE v = (VALUE)vstart;
+
+    for (;v != (VALUE)vend; v += stride) {
+	if (RBASIC(v)->flags) {
+	    counts[BUILTIN_TYPE(v)] += memsize_of(v);
+	}
+    }
+    return 0;
 }

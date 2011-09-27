@@ -296,7 +296,7 @@ rb_check_funcall(VALUE recv, ID mid, int argc, VALUE *argv)
     return check_funcall(recv, mid, argc, argv);
 }
 
-static const char *
+const char *
 rb_type_str(enum ruby_value_type type)
 {
 #define type_case(t) case t: return #t;
